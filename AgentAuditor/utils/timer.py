@@ -1,3 +1,4 @@
+import glob
 import json
 import os
 import signal
@@ -19,9 +20,23 @@ def _ensure_output_dir(dataset: str) -> str:
     return out_dir
 
 
+def _run_id() -> str:
+    """Identifies one pipeline run so every stage in it (each its own `python` process) lands in
+    the same timings file, while different runs get separate files instead of piling into one
+    ever-growing shared timings.json. Under SLURM this is the job ID; agent_auditor.sh also exports
+    AGENTAUDITOR_RUN_ID explicitly so stages still group together when run outside SLURM. Falls back
+    to a per-process id so at minimum, ad-hoc/concurrent runs don't collide."""
+    return (
+        os.environ.get("AGENTAUDITOR_RUN_ID")
+        or os.environ.get("SLURM_JOB_ID")
+        or os.environ.get("SLURM_JOBID")
+        or f"pid{os.getpid()}_{int(time.time())}"
+    )
+
+
 def _timing_file_path(dataset: str) -> str:
     out_dir = _ensure_output_dir(dataset)
-    return os.path.join(out_dir, "timings.json")
+    return os.path.join(out_dir, f"timings_{_run_id()}.json")
 
 
 # HiPerGator's burst QOS preempts by killing and requeuing the whole sbatch job (SIGTERM, then a
@@ -56,7 +71,7 @@ def _slurm_context() -> Dict[str, Any]:
 
 def time_and_record(stage_name: str, func: Callable, dataset: str, *args, **kwargs) -> Any:
     """Run `func(*args, **kwargs)` while timing it and record metrics under
-    `../temp/{dataset}/timings.json`.
+    `../temp/{dataset}/timings_<run_id>.json` (see `_run_id`).
 
     Returns the original function return value. On exception, records error details
     and re-raises the exception.
@@ -139,29 +154,32 @@ def time_and_record(stage_name: str, func: Callable, dataset: str, *args, **kwar
 
 
 def summarize_dataset_timings(dataset: str) -> Dict[str, Any]:
-    """Aggregate per-stage latency stats from `../temp/{dataset}/timings.json`.
+    """Aggregate per-stage latency stats across every `../temp/{dataset}/timings_*.json` run file
+    (plus a legacy `timings.json` if one's still there from before per-run files existed).
 
     Entries that failed, or were flagged unreliable (SIGTERM'd mid-stage, or written during a
     SLURM job that had already been requeued at least once - see `_slurm_context`), are excluded
     from the aggregates so burst-QOS preemption noise doesn't get baked into reported latency.
     """
-    path = _timing_file_path(dataset)
-    if not os.path.exists(path):
-        return {"excluded_entries": 0, "stages": {}}
-
-    try:
-        with open(path, 'r', encoding='utf-8') as f:
-            timings = json.load(f) or {}
-    except Exception:
-        return {"excluded_entries": 0, "stages": {}}
+    out_dir = _ensure_output_dir(dataset)
+    paths = sorted(glob.glob(os.path.join(out_dir, "timings_*.json")))
+    legacy_path = os.path.join(out_dir, "timings.json")
+    if os.path.exists(legacy_path):
+        paths.append(legacy_path)
 
     by_stage: Dict[str, List[float]] = {}
     excluded = 0
-    for entry in timings.values():
-        if not entry.get("success", False) or not entry.get("reliable", True):
-            excluded += 1
+    for path in paths:
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                timings = json.load(f) or {}
+        except Exception:
             continue
-        by_stage.setdefault(entry.get("stage", "unknown"), []).append(entry["duration_seconds"])
+        for entry in timings.values():
+            if not entry.get("success", False) or not entry.get("reliable", True):
+                excluded += 1
+                continue
+            by_stage.setdefault(entry.get("stage", "unknown"), []).append(entry["duration_seconds"])
 
     stages: Dict[str, Any] = {}
     for stage, durations in by_stage.items():
@@ -176,4 +194,4 @@ def summarize_dataset_timings(dataset: str) -> Dict[str, Any]:
             "p95_seconds": durations[min(n - 1, int(n * 0.95))],
         }
 
-    return {"excluded_entries": excluded, "stages": stages}
+    return {"runs_included": len(paths), "excluded_entries": excluded, "stages": stages}
